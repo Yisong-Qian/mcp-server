@@ -13,6 +13,8 @@ This MCP server provides the following tools:
 - **get_balance_sheets**: Get balance sheets for a company.
 - **get_cash_flow_statements**: Get cash flow statements for a company.
 - **get_current_stock_price**: Get the current / latest price of a company.
+- **get_current_stock_prices**: Get the current / latest prices for multiple companies concurrently.
+- **get_stock_screen_data**: Get price, income statements, balance sheets, cash flow statements, and news for multiple companies concurrently.
 - **get_historical_stock_prices**: Gets historical stock prices for a company.
 - **get_company_news**: Get news for a company.
 - **get_available_crypto_tickers**: Gets all available crypto tickers.

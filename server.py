@@ -1,8 +1,10 @@
 import json
 import os
+import asyncio
 import httpx
 import logging
 import sys
+from typing import Any
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 
@@ -17,27 +19,59 @@ logger = logging.getLogger("financial-datasets-mcp")
 # Initialize FastMCP server
 mcp = FastMCP("financial-datasets")
 
+# Load API key at startup and log a safe status
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(env_path, override=True)
+api_key_at_startup = os.environ.get("FINANCIAL_DATASETS_API_KEY", "NOT_FOUND")
+if api_key_at_startup == "NOT_FOUND":
+    logger.warning("API key not found at startup")
+else:
+    logger.info(
+        "API key loaded at startup: length=%s preview=%s...%s",
+        len(api_key_at_startup),
+        api_key_at_startup[:4],
+        api_key_at_startup[-4:],
+    )
+
 # Constants
 FINANCIAL_DATASETS_API_BASE = "https://api.financialdatasets.ai"
 
 
 # Helper function to make API requests
-async def make_request(url: str) -> dict[str, any] | None:
+async def make_request_with_client(url: str, client: httpx.AsyncClient) -> dict[str, Any] | None:
     """Make a request to the Financial Datasets API with proper error handling."""
-    # Load environment variables from .env file
-    load_dotenv()
-    
     headers = {}
     if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
         headers["X-API-KEY"] = api_key
 
+    try:
+        response = await client.get(url, headers=headers, timeout=30.0)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        return {"Error": str(e)}
+
+
+async def make_request(url: str) -> dict[str, Any] | None:
+    """Make a request to the Financial Datasets API with proper error handling."""
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, headers=headers, timeout=30.0)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            return {"Error": str(e)}
+        return await make_request_with_client(url, client)
+
+
+def normalize_tickers(tickers: list[str]) -> list[str]:
+    """Normalize ticker input while preserving order."""
+    clean_tickers = []
+    seen = set()
+    for ticker in tickers:
+        clean_ticker = ticker.strip().upper()
+        if clean_ticker and clean_ticker not in seen:
+            clean_tickers.append(clean_ticker)
+            seen.add(clean_ticker)
+    return clean_tickers
+
+
+def clamp(value: int, min_value: int, max_value: int) -> int:
+    return min(max(value, min_value), max_value)
 
 
 @mcp.tool()
@@ -160,6 +194,173 @@ async def get_current_stock_price(ticker: str) -> str:
 
     # Stringify the current price
     return json.dumps(snapshot, indent=2)
+
+
+@mcp.tool()
+async def get_current_stock_prices(
+    tickers: list[str],
+    max_concurrency: int = 20,
+) -> str:
+    """Get the current / latest prices for multiple companies concurrently.
+
+    Args:
+        tickers: Ticker symbols of the companies (e.g. ["AAPL", "MSFT", "NVDA"])
+        max_concurrency: Maximum concurrent API requests to run (default: 20)
+    """
+    clean_tickers = normalize_tickers(tickers)
+    if not clean_tickers:
+        return "Unable to fetch current prices: no valid tickers provided."
+
+    concurrency = clamp(max_concurrency, 1, 50)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async with httpx.AsyncClient() as client:
+        async def fetch_snapshot(ticker: str) -> dict[str, Any]:
+            url = f"{FINANCIAL_DATASETS_API_BASE}/prices/snapshot/?ticker={ticker}"
+            async with semaphore:
+                data = await make_request_with_client(url, client)
+
+            if not data:
+                return {"ticker": ticker, "error": "Unable to fetch current price."}
+            if error := data.get("Error"):
+                return {"ticker": ticker, "error": error}
+
+            snapshot = data.get("snapshot", {})
+            if not snapshot:
+                return {"ticker": ticker, "error": "No current price found."}
+
+            return snapshot
+
+        snapshots = await asyncio.gather(
+            *(fetch_snapshot(ticker) for ticker in clean_tickers)
+        )
+
+    return json.dumps(snapshots, indent=2)
+
+
+@mcp.tool()
+async def get_stock_screen_data(
+    tickers: list[str],
+    period: str = "annual",
+    financial_limit: int = 4,
+    news_limit: int = 5,
+    max_concurrency: int = 20,
+) -> str:
+    """Get screening data for multiple companies concurrently.
+
+    Fetches current price, income statements, balance sheets, cash flow
+    statements, and recent company news in one tool call.
+
+    Args:
+        tickers: Ticker symbols of the companies (e.g. ["AAPL", "MSFT", "NVDA"])
+        period: Financial statement period (e.g. annual, quarterly, ttm)
+        financial_limit: Number of financial statements per type to return (default: 4)
+        news_limit: Number of news items per ticker to return (default: 5)
+        max_concurrency: Maximum concurrent API requests to run (default: 20)
+    """
+    clean_tickers = normalize_tickers(tickers)
+    if not clean_tickers:
+        return "Unable to fetch stock screen data: no valid tickers provided."
+
+    statement_limit = clamp(financial_limit, 1, 10)
+    company_news_limit = clamp(news_limit, 0, 20)
+    concurrency = clamp(max_concurrency, 1, 50)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async with httpx.AsyncClient() as client:
+        async def fetch_json(url: str) -> dict[str, Any] | None:
+            async with semaphore:
+                return await make_request_with_client(url, client)
+
+        async def fetch_section(
+            ticker: str,
+            label: str,
+            url: str,
+            response_key: str,
+            empty_value: Any,
+        ) -> tuple[str, Any, str | None]:
+            data = await fetch_json(url)
+            if not data:
+                return label, empty_value, f"{label}: no data returned"
+            if error := data.get("Error"):
+                return label, empty_value, f"{label}: {error}"
+
+            payload = data.get(response_key, empty_value)
+            if label == "news" and isinstance(payload, list):
+                payload = payload[:company_news_limit]
+            if payload in ({}, []):
+                return label, empty_value, f"{label}: no {response_key} found"
+
+            return label, payload, None
+
+        async def fetch_ticker_data(ticker: str) -> dict[str, Any]:
+            endpoints = [
+                (
+                    "price",
+                    f"{FINANCIAL_DATASETS_API_BASE}/prices/snapshot/?ticker={ticker}",
+                    "snapshot",
+                    None,
+                ),
+                (
+                    "income_statements",
+                    f"{FINANCIAL_DATASETS_API_BASE}/financials/income-statements/?ticker={ticker}&period={period}&limit={statement_limit}",
+                    "income_statements",
+                    [],
+                ),
+                (
+                    "balance_sheets",
+                    f"{FINANCIAL_DATASETS_API_BASE}/financials/balance-sheets/?ticker={ticker}&period={period}&limit={statement_limit}",
+                    "balance_sheets",
+                    [],
+                ),
+                (
+                    "cash_flow_statements",
+                    f"{FINANCIAL_DATASETS_API_BASE}/financials/cash-flow-statements/?ticker={ticker}&period={period}&limit={statement_limit}",
+                    "cash_flow_statements",
+                    [],
+                ),
+                (
+                    "news",
+                    f"{FINANCIAL_DATASETS_API_BASE}/news/?ticker={ticker}",
+                    "news",
+                    [],
+                ),
+            ]
+            sections = await asyncio.gather(
+                *(
+                    fetch_section(ticker, label, url, response_key, empty_value)
+                    for label, url, response_key, empty_value in endpoints
+                )
+            )
+
+            result: dict[str, Any] = {"ticker": ticker}
+            errors = []
+            for label, payload, error in sections:
+                result[label] = payload
+                if error:
+                    errors.append(error)
+            if errors:
+                result["errors"] = errors
+
+            return result
+
+        screen_data = await asyncio.gather(
+            *(fetch_ticker_data(ticker) for ticker in clean_tickers)
+        )
+
+    return json.dumps(
+        {
+            "meta": {
+                "tickers": clean_tickers,
+                "period": period,
+                "financial_limit": statement_limit,
+                "news_limit": company_news_limit,
+                "max_concurrency": concurrency,
+            },
+            "data": screen_data,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
